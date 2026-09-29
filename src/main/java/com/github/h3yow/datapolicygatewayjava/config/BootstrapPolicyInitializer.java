@@ -1,10 +1,13 @@
 package com.github.h3yow.datapolicygatewayjava.config;
 
 import com.github.h3yow.datapolicygatewayjava.model.AccessAction;
+import com.github.h3yow.datapolicygatewayjava.model.ConditionOperator;
 import com.github.h3yow.datapolicygatewayjava.model.FieldPolicy;
 import com.github.h3yow.datapolicygatewayjava.model.MaskingType;
 import com.github.h3yow.datapolicygatewayjava.model.PolicyDefinition;
 import com.github.h3yow.datapolicygatewayjava.model.PolicyRule;
+import com.github.h3yow.datapolicygatewayjava.model.RecordConditionTerm;
+import com.github.h3yow.datapolicygatewayjava.model.RecordVisibilityCondition;
 import com.github.h3yow.datapolicygatewayjava.policy.PolicyStore;
 import org.springframework.boot.ApplicationArguments;
 import org.springframework.boot.ApplicationRunner;
@@ -66,6 +69,16 @@ public class BootstrapPolicyInitializer implements ApplicationRunner {
                 false);
     }
 
+    /**
+     * ANALYST 记录级可见性：仅可见 record.department == subject.department 的客户记录。
+     * 主体缺少 department 属性时条件无法求值，由网关整单失败关闭。
+     */
+    public static RecordVisibilityCondition analystOwnDepartmentCondition() {
+        return new RecordVisibilityCondition(List.of(
+                new RecordConditionTerm("department", ConditionOperator.EQ,
+                        null, "department")));
+    }
+
     public static PolicyRule analystRule() {
         return new PolicyRule("r-analyst-read",
                 Map.of("role", "ANALYST"),
@@ -78,7 +91,8 @@ public class BootstrapPolicyInitializer implements ApplicationRunner {
                         field("email", true, MaskingType.HASH, Map.of()),
                         field("nationalId", false, MaskingType.NONE, Map.of()),
                         field("salary", false, MaskingType.NONE, Map.of())),
-                false);
+                false,
+                analystOwnDepartmentCondition());
     }
 
     public static PolicyRule guestRule() {

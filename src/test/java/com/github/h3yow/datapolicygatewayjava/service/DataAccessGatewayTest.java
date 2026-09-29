@@ -43,8 +43,13 @@ class DataAccessGatewayTest {
     private DataAccessGateway gateway;
 
     private AccessRequest request(String requestId, String role) {
+        // ANALYST 规则含记录级条件 record.department == subject.department，
+        // 测试请求需携带所属部门（ENGINEERING 数据源有对应记录）
+        Map<String, String> attrs = "ANALYST".equals(role)
+                ? Map.of("role", role, "department", "ENGINEERING")
+                : Map.of("role", role);
         return new AccessRequest(requestId,
-                new SubjectAttributes("user-" + role, Map.of("role", role)),
+                new SubjectAttributes("user-" + role, attrs),
                 new ResourceRef(InMemoryDataSource.RESOURCE_TYPE, "*", Map.of()),
                 AccessAction.READ);
     }

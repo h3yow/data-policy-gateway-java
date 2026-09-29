@@ -109,9 +109,13 @@ class DataAccessGatewayConcurrencyTest {
                     for (int i = 0; i < requestsPerReader; i++) {
                         // 每 10 个请求里混入一个越权角色，验证拒绝路径也稳定
                         String useRole = (i % 10 == 9) ? "UNAUTH_ROLE" : role;
+                        // ANALYST 规则含记录级条件，需要主体携带 department 属性
+                        Map<String, String> subjectAttrs = "ANALYST".equals(useRole)
+                                ? Map.of("role", useRole, "department", "ENGINEERING")
+                                : Map.of("role", useRole);
                         String requestId = "conc-" + requestSeq.incrementAndGet();
                         AccessRequest request = new AccessRequest(requestId,
-                                new SubjectAttributes("u-" + useRole, Map.of("role", useRole)),
+                                new SubjectAttributes("u-" + useRole, subjectAttrs),
                                 new ResourceRef(InMemoryDataSource.RESOURCE_TYPE, "*", Map.of()),
                                 AccessAction.READ);
                         String responseVersion;

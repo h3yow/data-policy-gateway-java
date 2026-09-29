@@ -13,5 +13,7 @@ public enum DenyReason {
     /** 响应字段在策略中缺失映射，失败关闭。 */
     FIELD_MAPPING_MISSING,
     /** 脱敏规则执行异常，失败关闭。 */
-    MASKING_FAILED
+    MASKING_FAILED,
+    /** 记录级可见性条件无法求值（依赖字段缺失/结构不一致/比较失败），失败关闭。 */
+    RECORD_CONDITION_UNEVALUABLE
 }
