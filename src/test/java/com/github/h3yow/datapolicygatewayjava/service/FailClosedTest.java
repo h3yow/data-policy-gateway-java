@@ -6,6 +6,7 @@ import com.github.h3yow.datapolicygatewayjava.data.DataSource;
 import com.github.h3yow.datapolicygatewayjava.data.InMemoryDataSource;
 import com.github.h3yow.datapolicygatewayjava.gateway.AccessDeniedException;
 import com.github.h3yow.datapolicygatewayjava.gateway.DataAccessGateway;
+import com.github.h3yow.datapolicygatewayjava.gateway.IdempotentResultStore;
 import com.github.h3yow.datapolicygatewayjava.masking.Masker;
 import com.github.h3yow.datapolicygatewayjava.model.AccessAction;
 import com.github.h3yow.datapolicygatewayjava.model.AccessRequest;
@@ -15,6 +16,7 @@ import com.github.h3yow.datapolicygatewayjava.model.ResourceRef;
 import com.github.h3yow.datapolicygatewayjava.model.SubjectAttributes;
 import com.github.h3yow.datapolicygatewayjava.policy.PolicyEvaluator;
 import com.github.h3yow.datapolicygatewayjava.policy.PolicyStore;
+import com.github.h3yow.datapolicygatewayjava.visibility.RecordVisibilityEvaluator;
 import org.junit.jupiter.api.Test;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -78,7 +80,8 @@ class FailClosedTest {
 
         AuditService audit = new AuditService();
         DataAccessGateway gateway = new DataAccessGateway(store, new PolicyEvaluator(),
-                new Masker(), audit, List.of(new InMemoryDataSource()));
+                new RecordVisibilityEvaluator(), new Masker(), audit,
+                new IdempotentResultStore(), List.of(new InMemoryDataSource()));
 
         AccessDeniedException ex = assertThrows(AccessDeniedException.class,
                 () -> gateway.execute(adminRequest("req-mask-fail")));
@@ -102,7 +105,8 @@ class FailClosedTest {
         PolicyStore empty = new PolicyStore();
         AuditService audit = new AuditService();
         DataAccessGateway gateway = new DataAccessGateway(empty, new PolicyEvaluator(),
-                new Masker(), audit, List.of(new InMemoryDataSource()));
+                new RecordVisibilityEvaluator(), new Masker(), audit,
+                new IdempotentResultStore(), List.of(new InMemoryDataSource()));
 
         AccessDeniedException ex = assertThrows(AccessDeniedException.class,
                 () -> gateway.execute(adminRequest("req-no-policy")));
@@ -118,7 +122,8 @@ class FailClosedTest {
         store.publish(BootstrapPolicyInitializer.v1(), null);
         AuditService audit = new AuditService();
         DataAccessGateway gateway = new DataAccessGateway(store, new PolicyEvaluator(),
-                new Masker(), audit, List.of(new InMemoryDataSource()));
+                new RecordVisibilityEvaluator(), new Masker(), audit,
+                new IdempotentResultStore(), List.of(new InMemoryDataSource()));
 
         AccessRequest req = new AccessRequest("req-bad-resource",
                 new SubjectAttributes("u-admin", Map.of("role", "ADMIN")),

@@ -13,11 +13,24 @@ import java.util.Map;
  * @param action         访问动作
  * @param fieldPolicies  字段策略列表
  * @param defaultVisible 未被 fieldPolicies 覆盖字段的默认可见性
+ * @param recordCondition 记录级可见性条件；null 表示该规则不做记录级过滤
  */
 public record PolicyRule(String ruleId,
                          Map<String, String> subjectConditions,
                          String resourceType,
                          AccessAction action,
                          List<FieldPolicy> fieldPolicies,
-                         boolean defaultVisible) {
+                         boolean defaultVisible,
+                         RecordVisibilityCondition recordCondition) {
+
+    /** 兼容无记录级条件的规则（等价于 recordCondition=null）。 */
+    public PolicyRule(String ruleId,
+                      Map<String, String> subjectConditions,
+                      String resourceType,
+                      AccessAction action,
+                      List<FieldPolicy> fieldPolicies,
+                      boolean defaultVisible) {
+        this(ruleId, subjectConditions, resourceType, action,
+                fieldPolicies, defaultVisible, null);
+    }
 }

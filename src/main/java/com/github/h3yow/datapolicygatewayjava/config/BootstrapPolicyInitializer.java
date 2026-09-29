@@ -1,10 +1,14 @@
 package com.github.h3yow.datapolicygatewayjava.config;
 
 import com.github.h3yow.datapolicygatewayjava.model.AccessAction;
+import com.github.h3yow.datapolicygatewayjava.model.ConditionOperator;
+import com.github.h3yow.datapolicygatewayjava.model.ConditionValueSource;
 import com.github.h3yow.datapolicygatewayjava.model.FieldPolicy;
 import com.github.h3yow.datapolicygatewayjava.model.MaskingType;
 import com.github.h3yow.datapolicygatewayjava.model.PolicyDefinition;
 import com.github.h3yow.datapolicygatewayjava.model.PolicyRule;
+import com.github.h3yow.datapolicygatewayjava.model.RecordConditionTerm;
+import com.github.h3yow.datapolicygatewayjava.model.RecordVisibilityCondition;
 import com.github.h3yow.datapolicygatewayjava.policy.PolicyStore;
 import org.springframework.boot.ApplicationArguments;
 import org.springframework.boot.ApplicationRunner;
@@ -46,6 +50,35 @@ public class BootstrapPolicyInitializer implements ApplicationRunner {
 
     public static PolicyDefinition v1() {
         return new PolicyDefinition("v1", List.of(adminRule(), analystRule(), guestRule()));
+    }
+
+    /**
+     * 记录级可见性示例策略 {@code v2}：字段级策略与 v1 相同，额外在分析人员规则上声明
+     * 记录级条件 —— 仅当记录的 {@code department} 等于主体属性 {@code department} 时该记录可见。
+     * 管理员规则不带记录级条件，可见全部记录；GUEST 规则同样不带条件。
+     */
+    public static PolicyDefinition v2RecordScoped() {
+        return new PolicyDefinition("v2", List.of(
+                adminRule(),
+                analystDepartmentScopedRule(),
+                guestRule()));
+    }
+
+    /**
+     * 分析人员规则（记录级限定部门）：字段级策略同 {@link #analystRule()}，
+     * 附加条件 {@code record.department == subject.department}。
+     */
+    public static PolicyRule analystDepartmentScopedRule() {
+        return new PolicyRule("r-analyst-read-dept",
+                Map.of("role", "ANALYST"),
+                "customer", AccessAction.READ,
+                analystRule().fieldPolicies(),
+                false,
+                new RecordVisibilityCondition(List.of(
+                        new RecordConditionTerm("department",
+                                ConditionOperator.EQ,
+                                ConditionValueSource.SUBJECT,
+                                "department", null))));
     }
 
     public static PolicyRule adminRule() {

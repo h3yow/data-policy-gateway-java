@@ -62,10 +62,14 @@ class DataAccessWebIntegrationTest {
     }
 
     private String queryBody(String requestId, String role) {
+        return queryBody(requestId, Map.of("role", role));
+    }
+
+    private String queryBody(String requestId, Map<String, String> attributes) {
         Map<String, Object> body = new LinkedHashMap<>();
         body.put("requestId", requestId);
-        body.put("subject", Map.of("subjectId", "u-" + role,
-                "attributes", Map.of("role", role)));
+        body.put("subject", Map.of("subjectId", "u-" + attributes.get("role"),
+                "attributes", attributes));
         body.put("resource", Map.of("resourceType", "customer",
                 "resourceId", "*", "attributes", Map.of()));
         body.put("action", "READ");
@@ -157,6 +161,93 @@ class DataAccessWebIntegrationTest {
         log.info("web test: input=publish v3 expectedParent=v99, basis='未知父版本拒绝 409', body={}",
                 mismatch.getResponse().getContentAsString());
         assertTrue(mismatch.getResponse().getContentAsString().contains("does not match"));
+    }
+
+    /**
+     * 通过 HTTP 发布带记录级条件的 v2（JSON 反序列化 recordCondition），
+     * 再以 ENGINEERING 分析人员查询：只剩 2 条 ENGINEERING 记录，且字段级哈希/剥离仍生效。
+     */
+    @Test
+    void recordScopedPolicyOverHttpFiltersWholeRecords() throws Exception {
+        String v2 = """
+                {"version":"v2","rules":[
+                  {"ruleId":"r-admin-read","resourceType":"customer","action":"READ",
+                   "defaultVisible":false,"subjectConditions":{"role":"ADMIN"},
+                   "fieldPolicies":[
+                     {"fieldName":"id","visible":true,"maskingType":"NONE","maskingParams":{}},
+                     {"fieldName":"name","visible":true,"maskingType":"NONE","maskingParams":{}},
+                     {"fieldName":"department","visible":true,"maskingType":"NONE","maskingParams":{}},
+                     {"fieldName":"nationalId","visible":true,"maskingType":"PARTIAL_MASK",
+                      "maskingParams":{"prefix":"4","suffix":"4"}},
+                     {"fieldName":"phone","visible":true,"maskingType":"PARTIAL_MASK",
+                      "maskingParams":{"prefix":"3","suffix":"4"}},
+                     {"fieldName":"email","visible":true,"maskingType":"PARTIAL_MASK",
+                      "maskingParams":{"prefix":"2","suffix":"5"}},
+                     {"fieldName":"salary","visible":true,"maskingType":"NONE","maskingParams":{}}]},
+                  {"ruleId":"r-analyst-read-dept","resourceType":"customer","action":"READ",
+                   "defaultVisible":false,"subjectConditions":{"role":"ANALYST"},
+                   "recordCondition":{"terms":[
+                     {"fieldName":"department","operator":"EQ",
+                      "valueSource":"SUBJECT","referenceKey":"department"}]},
+                   "fieldPolicies":[
+                     {"fieldName":"id","visible":true,"maskingType":"NONE","maskingParams":{}},
+                     {"fieldName":"name","visible":true,"maskingType":"NONE","maskingParams":{}},
+                     {"fieldName":"department","visible":true,"maskingType":"NONE","maskingParams":{}},
+                     {"fieldName":"phone","visible":true,"maskingType":"HASH","maskingParams":{}},
+                     {"fieldName":"email","visible":true,"maskingType":"HASH","maskingParams":{}},
+                     {"fieldName":"nationalId","visible":false,"maskingType":"NONE","maskingParams":{}},
+                     {"fieldName":"salary","visible":false,"maskingType":"NONE","maskingParams":{}}]}]}
+                """;
+        mvc().perform(post("/api/policies")
+                        .param("expectedParentVersion", "v1")
+                        .contentType(MediaType.APPLICATION_JSON).content(v2))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.policyVersion").value("v2"));
+
+        MvcResult result = mvc().perform(post("/api/data/query")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(queryBody("web-record-1",
+                                Map.of("role", "ANALYST", "department", "ENGINEERING"))))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.allowed").value(true))
+                .andExpect(jsonPath("$.policyVersion").value("v2"))
+                .andReturn();
+        JsonNode json = objectMapper.readTree(result.getResponse().getContentAsString());
+        List<String> ids = new java.util.ArrayList<>();
+        json.get("records").forEach(r -> ids.add(r.get("id").asText()));
+        log.info("web test: input=ANALYST department=ENGINEERING under record-scoped v2, "
+                + "basis='HTTP 记录级过滤整条消失 + 字段级哈希/剥离', ids={}", ids);
+
+        // 内置数据：C001=ENGINEERING, C002=FINANCE, C003=SALES -> 仅 C001 整条可见
+        assertEquals(List.of("C001"), ids, "非本部门记录必须整条不出现");
+        JsonNode first = json.get("records").get(0);
+        assertFalse(first.has("nationalId"));
+        assertFalse(first.has("salary"));
+        assertEquals(64, first.get("phone").asText().length());
+    }
+
+    @Test
+    void missingSubjectAttributeForRecordConditionGets403WithDistinctReason() throws Exception {
+        // 发布记录级 v2 后，以无 department 属性的 ANALYST 查询：规则命中但条件不可求值
+        mvc().perform(post("/api/policies").param("expectedParentVersion", "v1")
+                .contentType(MediaType.APPLICATION_JSON)
+                .content(objectMapper.writeValueAsString(
+                        BootstrapPolicyInitializer.v2RecordScoped())))
+                .andExpect(status().isOk());
+
+        MvcResult result = mvc().perform(post("/api/data/query")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(queryBody("web-record-deny-1", "ANALYST")))
+                .andExpect(status().isForbidden())
+                .andExpect(jsonPath("$.denyReason").value("RECORD_CONDITION_FAILED"))
+                .andExpect(jsonPath("$.records").isArray())
+                .andReturn();
+        String body = result.getResponse().getContentAsString();
+        log.info("web test: input=ANALYST without department attr under record-scoped v2, "
+                + "basis='HTTP 条件不可求值 403，原因码区别于 NO_MATCH/FIELD_FORBIDDEN', body={}",
+                body);
+        assertEquals(0, objectMapper.readTree(body).get("records").size());
+        assertFalse(body.contains("nationalId"));
     }
 
     @Test

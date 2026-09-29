@@ -6,6 +6,7 @@ import com.github.h3yow.datapolicygatewayjava.config.BootstrapPolicyInitializer;
 import com.github.h3yow.datapolicygatewayjava.data.InMemoryDataSource;
 import com.github.h3yow.datapolicygatewayjava.gateway.AccessDeniedException;
 import com.github.h3yow.datapolicygatewayjava.gateway.DataAccessGateway;
+import com.github.h3yow.datapolicygatewayjava.gateway.IdempotentResultStore;
 import com.github.h3yow.datapolicygatewayjava.masking.Masker;
 import com.github.h3yow.datapolicygatewayjava.model.AccessAction;
 import com.github.h3yow.datapolicygatewayjava.model.AccessRequest;
@@ -16,6 +17,7 @@ import com.github.h3yow.datapolicygatewayjava.model.ResourceRef;
 import com.github.h3yow.datapolicygatewayjava.model.SubjectAttributes;
 import com.github.h3yow.datapolicygatewayjava.policy.PolicyEvaluator;
 import com.github.h3yow.datapolicygatewayjava.policy.PolicyStore;
+import com.github.h3yow.datapolicygatewayjava.visibility.RecordVisibilityEvaluator;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.slf4j.Logger;
@@ -55,7 +57,8 @@ class DataAccessGatewayTest {
         policyStore.publish(BootstrapPolicyInitializer.v1(), null);
         auditService = new AuditService();
         gateway = new DataAccessGateway(policyStore,
-                new PolicyEvaluator(), new Masker(), auditService,
+                new PolicyEvaluator(), new RecordVisibilityEvaluator(), new Masker(),
+                auditService, new IdempotentResultStore(),
                 List.of(new InMemoryDataSource()));
     }
 

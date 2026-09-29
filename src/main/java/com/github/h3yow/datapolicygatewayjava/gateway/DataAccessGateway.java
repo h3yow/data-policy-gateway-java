@@ -17,12 +17,15 @@ import com.github.h3yow.datapolicygatewayjava.model.ResourceRef;
 import com.github.h3yow.datapolicygatewayjava.policy.PolicyEvaluator;
 import com.github.h3yow.datapolicygatewayjava.policy.PolicySnapshot;
 import com.github.h3yow.datapolicygatewayjava.policy.PolicyStore;
+import com.github.h3yow.datapolicygatewayjava.visibility.RecordVisibilityException;
+import com.github.h3yow.datapolicygatewayjava.visibility.RecordVisibilityEvaluator;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -34,9 +37,14 @@ import java.util.Set;
  *
  * <p>执行序列：
  * <ol>
+ *   <li>以 requestId 为幂等键：已有首次结果则直接复现（即使期间策略已更新），
+ *       否则只有一个线程进入实际执行；</li>
  *   <li>从 {@link PolicyStore} 抓取一个不可变快照；无策略可用 → 失败关闭；</li>
  *   <li>用快照做字段级求值（不接触数据值）；整体拒绝（无匹配）→ 审计后拒绝；</li>
- *   <li>仅在求值可能放行后才从数据源取数，原始数据不离开本组件；</li>
+ *   <li>仅在字段级判定可能放行后才从数据源取数，原始数据不离开本组件；
+ *       字段级判定与记录级过滤使用<b>同一个快照、同一条命中规则</b>；</li>
+ *   <li>记录级过滤：按命中规则的 recordCondition 过滤，不满足条件的记录整条不出现；
+ *       条件无法求值/结构不一致 → 整单 RECORD_CONDITION_FAILED，空记录集；</li>
  *   <li>逐记录逐字段处理：显式禁止字段剥离、映射缺失失败关闭、按规则脱敏、
  *       脱敏异常失败关闭；</li>
  *   <li>无论放行还是拒绝，都以 requestId 幂等写一条与响应<b>同版本</b>的审计记录；</li>
@@ -50,19 +58,25 @@ public class DataAccessGateway {
 
     private final PolicyStore policyStore;
     private final PolicyEvaluator evaluator;
+    private final RecordVisibilityEvaluator recordVisibilityEvaluator;
     private final Masker masker;
     private final AuditService auditService;
+    private final IdempotentResultStore resultStore;
     private final List<DataSource> dataSources;
 
     public DataAccessGateway(PolicyStore policyStore,
                              PolicyEvaluator evaluator,
+                             RecordVisibilityEvaluator recordVisibilityEvaluator,
                              Masker masker,
                              AuditService auditService,
+                             IdempotentResultStore resultStore,
                              List<DataSource> dataSources) {
         this.policyStore = policyStore;
         this.evaluator = evaluator;
+        this.recordVisibilityEvaluator = recordVisibilityEvaluator;
         this.masker = masker;
         this.auditService = auditService;
+        this.resultStore = resultStore;
         this.dataSources = dataSources;
     }
 
@@ -73,6 +87,19 @@ public class DataAccessGateway {
                 request.resource().resourceType(), request.resource().resourceId(),
                 request.action());
 
+        // 同一 requestId：并发/重复提交/更新后重试都复现首次结果；producer 全局至多执行一次
+        StoredOutcome outcome = resultStore.computeIfAbsent(
+                request.requestId(), () -> doExecute(request));
+        if (!outcome.allowed()) {
+            throw new AccessDeniedException(request.requestId(), outcome.policyVersion(),
+                    outcome.denyReason(), outcome.reasonDetail());
+        }
+        return new AccessResult(request.requestId(), outcome.policyVersion(), true, null, null,
+                outcome.matchedRuleId(), outcome.records());
+    }
+
+    /** 每个 requestId 全局至多执行一次：抓取快照 → 求值 → 记录过滤 → 字段处理 → 审计。 */
+    private StoredOutcome doExecute(AccessRequest request) {
         // 1. 抓取快照：整次请求（响应 + 审计）只引用它
         PolicySnapshot snapshot = policyStore.current();
         if (snapshot == null) {
@@ -110,10 +137,22 @@ public class DataAccessGateway {
                     decision.denyReason(), decision.reasonDetail());
         }
 
-        // 4. 逐记录处理；任一字段异常即整单失败关闭
+        PolicyRule matchedRule = findRule(snapshot, decision.matchedRuleId());
+
+        // 4. 记录级过滤：不满足条件的记录整条消失；无法求值则整单失败关闭
+        List<Map<String, Object>> visibleRecords;
+        try {
+            visibleRecords = recordVisibilityEvaluator.filter(
+                    matchedRule, request.subject(), rawRecords);
+        } catch (RecordVisibilityException e) {
+            return deny(request, version, decision.matchedRuleId(),
+                    e.reason(), e.getMessage());
+        }
+
+        // 5. 逐记录做字段级剥离/脱敏；任一字段异常即整单失败关闭
         List<Map<String, Object>> safeRecords;
         try {
-            safeRecords = applyDecision(decision, snapshot, rawRecords);
+            safeRecords = applyDecision(decision, matchedRule, visibleRecords);
         } catch (MaskingException e) {
             return deny(request, version, decision.matchedRuleId(),
                     DenyReason.MASKING_FAILED, "masking rule failed");
@@ -121,8 +160,10 @@ public class DataAccessGateway {
             return deny(request, version, decision.matchedRuleId(),
                     DenyReason.EVALUATION_FAILED, "field processing error");
         }
+        // 不可变快照，重试时原样复现
+        List<Map<String, Object>> frozen = deepImmutable(safeRecords);
 
-        // 5. 放行 + 幂等审计（与响应同版本、同规则）
+        // 6. 放行 + 幂等审计（与响应同版本、同规则）；审计只在首次执行发生，天然不重不漏
         AuditRecord record = new AuditRecord(request.requestId(), Instant.now(),
                 request.subject().subjectId(), request.resource().resourceType(),
                 request.resource().resourceId(), request.action().name(),
@@ -131,17 +172,17 @@ public class DataAccessGateway {
         log.info("access allowed: requestId={}, policyVersion={}, matchedRuleId={}, "
                         + "recordCount={}, auditWritten={}",
                 request.requestId(), version, decision.matchedRuleId(),
-                safeRecords.size(), firstWrite);
-        return new AccessResult(request.requestId(), version, true, null, null,
-                decision.matchedRuleId(), safeRecords);
+                frozen.size(), firstWrite);
+        return new StoredOutcome(true, version, decision.matchedRuleId(),
+                null, null, frozen);
     }
 
-    private AccessResult deny(AccessRequest request,
+    private StoredOutcome deny(AccessRequest request,
                               String version,
                               String matchedRuleId,
                               DenyReason reason,
                               String detail) {
-        // 拒绝也必须审计；幂等保证重试不重复
+        // 拒绝也必须审计；本方法每个 requestId 只执行一次，重试只复现结果，不重复审计
         AuditRecord record = new AuditRecord(request.requestId(), Instant.now(),
                 request.subject() == null ? null : request.subject().subjectId(),
                 request.resource() == null ? null : request.resource().resourceType(),
@@ -153,13 +194,22 @@ public class DataAccessGateway {
         log.warn("access denied: requestId={}, policyVersion={}, reason={}, detail={}, "
                         + "auditWritten={}",
                 request.requestId(), version, reason, detail, firstWrite);
-        throw new AccessDeniedException(request.requestId(), version, reason, detail);
+        return new StoredOutcome(false, version, matchedRuleId,
+                reason, detail, List.of());
+    }
+
+    @SuppressWarnings("unchecked")
+    private List<Map<String, Object>> deepImmutable(List<Map<String, Object>> records) {
+        List<Map<String, Object>> frozen = new ArrayList<>(records.size());
+        for (Map<String, Object> row : records) {
+            frozen.add(Collections.unmodifiableMap(new LinkedHashMap<>(row)));
+        }
+        return List.copyOf(frozen);
     }
 
     private List<Map<String, Object>> applyDecision(AccessDecision decision,
-                                                    PolicySnapshot snapshot,
+                                                    PolicyRule matchedRule,
                                                     List<Map<String, Object>> rawRecords) {
-        PolicyRule matchedRule = findRule(snapshot, decision.matchedRuleId());
         Map<String, FieldPolicy> policyByName = new LinkedHashMap<>();
         if (matchedRule != null) {
             for (FieldPolicy fp : matchedRule.fieldPolicies()) {

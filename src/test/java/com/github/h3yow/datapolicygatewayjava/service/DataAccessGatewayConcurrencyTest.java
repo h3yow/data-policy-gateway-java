@@ -6,6 +6,7 @@ import com.github.h3yow.datapolicygatewayjava.config.BootstrapPolicyInitializer;
 import com.github.h3yow.datapolicygatewayjava.data.InMemoryDataSource;
 import com.github.h3yow.datapolicygatewayjava.gateway.AccessDeniedException;
 import com.github.h3yow.datapolicygatewayjava.gateway.DataAccessGateway;
+import com.github.h3yow.datapolicygatewayjava.gateway.IdempotentResultStore;
 import com.github.h3yow.datapolicygatewayjava.masking.Masker;
 import com.github.h3yow.datapolicygatewayjava.model.AccessAction;
 import com.github.h3yow.datapolicygatewayjava.model.AccessRequest;
@@ -21,6 +22,7 @@ import com.github.h3yow.datapolicygatewayjava.policy.PolicyEvaluator;
 import com.github.h3yow.datapolicygatewayjava.policy.PolicySnapshot;
 import com.github.h3yow.datapolicygatewayjava.policy.PolicyStore;
 import com.github.h3yow.datapolicygatewayjava.policy.PolicyVersionException;
+import com.github.h3yow.datapolicygatewayjava.visibility.RecordVisibilityEvaluator;
 import org.junit.jupiter.api.Test;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -64,7 +66,8 @@ class DataAccessGatewayConcurrencyTest {
         policyStore.publish(versionedDef("v1"), null);
         AuditService auditService = new AuditService();
         DataAccessGateway gateway = new DataAccessGateway(
-                policyStore, new PolicyEvaluator(), new Masker(), auditService,
+                policyStore, new PolicyEvaluator(), new RecordVisibilityEvaluator(),
+                new Masker(), auditService, new IdempotentResultStore(),
                 List.of(new InMemoryDataSource()));
 
         final int versions = 20;
