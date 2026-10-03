@@ -9,23 +9,26 @@
 
 ```bash
 mvn spring-boot:run        # 启动，自动装载初始策略 v1
-mvn test                   # 运行全部 55 个单测/集成测试
+mvn test                   # 运行全部 58 个单测/集成测试
 ```
 
-发起一次读取。ANALYST 必须带所属部门 `department`：v1 的记录级条件为
-`record.department == subject.department`，因此 ENGINEERING 部门的分析人员**只看到 1 条本部门客户**；
-同时 `nationalId`/`salary` 越权被剥离，`phone`/`email` 哈希：
+发起一次读取。**在服的初始策略 v1 只做字段级授权/脱敏，不做记录级过滤**
+（记录级可见性是按版本 opt-in 的能力，见 2.0）：ANALYST 即使只带角色、不带所属部门，
+也和迭代前一样拿到全部 3 条客户，`nationalId`/`salary` 越权被剥离，`phone`/`email` 哈希：
 
 ```bash
 curl -s -X POST http://localhost:8080/api/data/query \
   -H 'Content-Type: application/json' \
   -d '{
     "requestId":"req-001",
-    "subject":{"subjectId":"u-1","attributes":{"role":"ANALYST","department":"ENGINEERING"}},
+    "subject":{"subjectId":"u-1","attributes":{"role":"ANALYST"}},
     "resource":{"resourceType":"customer","resourceId":"*","attributes":{}},
     "action":"READ"
   }'
 ```
+
+业务方按自己的节奏发布启用记录级可见性的新版本后（如 v2），ENGINEERING 部门的分析人员
+才会**只看到 1 条本部门客户**；未升级前线上既有请求的返回一条都不变。
 
 同一 `requestId` 重复提交（即使期间已发布新策略版本）会原样复现首次响应：
 同样的可见记录、同样的脱敏结果，或同样的拒绝原因；审计不重复、不缺失。
@@ -65,7 +68,22 @@ PolicyDefinition(version, rules[])
 
 ### 2.0 记录级可见性语义（`recordCondition`）
 
-`recordCondition` 挂在**规则**上，与字段级策略属于同一条规则、同一份策略版本：
+`recordCondition` 挂在**规则**上，与字段级策略属于同一条规则、同一份策略版本。
+
+**按策略版本主动启用（opt-in），绝不影响在服流量**：记录级过滤只在规则**显式声明**
+`recordCondition` 的策略版本上生效；规则缺省该条件时，记录过滤完全不介入
+（等价于字段级时代的行为）。因此：
+
+- 当前正在服务的初始策略 **v1 不挂任何记录级条件**——只带 `role=ANALYST`、不带
+  `department` 的既有调用保持原返回（全部客户记录，字段剥离/脱敏照旧），不会出现
+  “原来放行、现在整条被拒”；
+- 业务方按自己的节奏发布新版本（如 v2，在 ANALYST 规则上声明本部门条件）后，
+  记录级能力才对该版本生效；升级动作与版本号绑定，可灰度、可预期。
+  系统内置的 opt-in 策略工厂为
+  `BootstrapPolicyInitializer.recordVisibilityOptInDefinition("v2")`，
+  其字段级规则与 v1 完全一致，仅 ANALYST 规则额外携带记录条件。
+
+条件语义：
 
 - 条件由若干 `RecordConditionTerm` 组成，**全部成立（AND）** 时记录可见；
   当前支持 `EQ`：`record[field] == 期望值`。右值二选一：
@@ -74,7 +92,8 @@ PolicyDefinition(version, rules[])
     （如 `record.department == subject.department`）。
 - **不满足条件的记录整条消失**——返回的是过滤后的记录集，而不是字段被掏空的记录；
   没有任何记录命中时返回空集，请求仍为允许（allowed=true）。
-- `recordCondition` 缺省/空：该规则不做记录级过滤（管理员看全部），旧策略定义零改动兼容。
+- `recordCondition` 缺省/空：该规则不做记录级过滤（管理员看全部、v1 分析人员也看全部），
+  旧策略定义零改动兼容。
 - **两层一起判定，不各判各的**：网关在请求开始抓取一次不可变快照，字段级判定、
   记录级过滤、字段剥离/脱敏、审计全部引用同一快照。因此一次响应中的
   **可见记录、字段结果与审计记录必然来自同一个策略版本**，不会出现“字段按 v2、
@@ -111,15 +130,19 @@ PolicyDefinition(version, rules[])
 **记录条件算不出来**（`RECORD_CONDITION_UNEVALUABLE`，整单拒绝且零记录）。
 所有原因码均出现在 HTTP 响应与审计记录中。
 
-### 2.2 初始策略 v1（customer 资源，READ）
+### 2.2 初始策略 v1（customer 资源，READ，当前在服）
 
 | 规则 | 角色 | 记录级可见性 | 可见字段 | 处理 |
 |---|---|---|---|---|
 | `r-admin-read` | ADMIN | 无条件（全部记录） | 全部 | `nationalId`/`phone`/`email` 局部掩码 |
-| `r-analyst-read` | ANALYST | `department == subject.department`（仅本部门） | 除 `nationalId`、`salary` 外 | `phone`/`email` 哈希；越权字段剥离 |
+| `r-analyst-read` | ANALYST | **无条件（全部记录，未 opt-in）** | 除 `nationalId`、`salary` 外 | `phone`/`email` 哈希；越权字段剥离 |
 | `r-guest-read` | GUEST | 无条件 | `id`/`name`/`department` | 其余字段显式拒绝 |
 
-带记录级条件的规则 JSON 示例：
+> v1 的 ANALYST 规则**故意不带 `recordCondition`**：这是现网正在服务的策略，
+> 只带角色不带部门的既有调用必须保持迭代前的返回。启用记录级过滤的做法是
+> **发布新版本**（v2+），而不是改动在服的 v1 规则。
+
+启用记录级可见性的新版本中，ANALYST 规则 JSON 示例（opt-in v2）：
 
 ```json
 {
@@ -202,13 +225,29 @@ PolicyDefinition(version, rules[])
 | `PolicyEvaluatorTest` | 无匹配 vs 显式越权 vs 映射缺失的可区分原因、动作/资源匹配、首条命中稳定性 |
 | `RecordVisibilityEvaluatorTest` | 记录条件命中/不命中整条过滤、字面量与主体属性右值、null/空条件、依赖字段缺失、主体属性缺失、同批结构不一致、条件值为 null、条件项非法——全部边界要么正确过滤要么整单失败关闭 |
 | `DataAccessGatewayTest` | 端到端脱敏/剥离、拒绝原因区分、映射缺失失败关闭、重试审计幂等（允许与拒绝） |
-| `RecordLevelAccessGatewayTest` | 分析人员仅见本部门/管理员见全部、记录过滤与字段剥离哈希叠加、缺条件字段/结构不一致/主体属性缺失的 `RECORD_CONDITION_UNEVALUABLE` 整单拒绝、策略 v1→v2 后同标识重试复现首次可见记录与首次拒绝（含审计不重不漏） |
-| `RecordVisibilityConcurrencyTest` | 更新前后两阶段 8×100 并发读取：每条响应记录数/字段/审计同版本自洽；16 个同 requestId 在更新窗口内并发/延迟提交：single-flight 全部复现首次（v1/1 条）、审计恰好一条 |
+| `RecordLevelAccessGatewayTest` | **在服 v1 回归**：ANALYST 不带/带部门都保持原返回（全部 3 条 + 原字段控制）；opt-in v2 后仅见本部门、记录过滤与字段剥离哈希叠加；缺条件字段/结构不一致/主体属性缺失的 `RECORD_CONDITION_UNEVALUABLE` 整单拒绝；v1→v2 后同标识重试复现首次可见记录、opt-in 拒绝在关闭记录级后仍复现首次拒绝（含审计不重不漏） |
+| `RecordVisibilityConcurrencyTest` | v1（未过滤 3 条）→ v2（opt-in 1 条）两阶段 8×100 并发读取：每条响应记录数/字段/审计同版本自洽；16 个同 requestId 在更新窗口内并发/延迟提交：single-flight 全部复现首次（v1/3 条）、审计恰好一条 |
 | `FailClosedTest` | 脱敏异常整单拒绝、无策略失败关闭、无数据源失败关闭 |
 | `DataAccessGatewayConcurrencyTest` | 8 读线程 ×200 请求与 19 次版本发布并发：响应与审计同版本、回退全被拒、审计不重不漏 |
-| `DataAccessWebIntegrationTest` | HTTP 端到端：字段不出现在 403 响应、记录级部门过滤与重放、记录条件无法求值 403 专码、409 版本冲突、缺 requestId 返回 400 |
+| `DataAccessWebIntegrationTest` | HTTP 端到端：字段不出现在 403 响应、**v1 上不带部门的 ANALYST 恢复原返回（3 条）**、opt-in v2 后记录级部门过滤与重放、记录条件无法求值 403 专码、409 版本冲突、缺 requestId 返回 400 |
 
-手工验证记录级失败关闭（ANALYST 不带 `department`，预期 403 + `RECORD_CONDITION_UNEVALUABLE`）：
+手工验证**在服 v1 回归**（ANALYST 不带 `department`，预期 200 + 全部 3 条记录；
+这是本次修复的核心——既有调用恢复原样）：
+
+```bash
+curl -s -X POST http://localhost:8080/api/data/query \
+  -H 'Content-Type: application/json' \
+  -d '{"requestId":"req-manual-0",
+       "subject":{"subjectId":"u-1","attributes":{"role":"ANALYST"}},
+       "resource":{"resourceType":"customer","resourceId":"*","attributes":{}},
+       "action":"READ"}'
+# -> {"requestId":"req-manual-0","allowed":true,"policyVersion":"v1",
+#     "matchedRuleId":"r-analyst-read","records":[ ... 3 条，nationalId/salary 已剥离 ... ]}
+```
+
+手工验证**按版本 opt-in 与记录级失败关闭**：先发布在 ANALYST 规则上启用记录条件的 v2
+（可由管理端按 2.2 的 JSON 发布），再以不带 `department` 的 ANALYST 查询，
+预期 403 + `RECORD_CONDITION_UNEVALUABLE`：
 
 ```bash
 curl -s -X POST http://localhost:8080/api/data/query \
@@ -217,19 +256,20 @@ curl -s -X POST http://localhost:8080/api/data/query \
        "subject":{"subjectId":"u-1","attributes":{"role":"ANALYST"}},
        "resource":{"resourceType":"customer","resourceId":"*","attributes":{}},
        "action":"READ"}'
-# -> {"requestId":"req-manual-1","allowed":false,"policyVersion":"v1",
+# -> {"requestId":"req-manual-1","allowed":false,"policyVersion":"v2",
 #     "denyReason":"RECORD_CONDITION_UNEVALUABLE","records":[]}
 ```
 
-手工验证更新后重放：先用 `req-manual-2` + ANALYST/ENGINEERING 查到 1 条记录，
-再 `POST /api/policies?expectedParentVersion=v1` 发布去掉记录级条件的 v2，
-用**同一个 requestId** 重试——仍返回 v1 的 1 条记录与哈希脱敏，审计仅一条。
+手工验证更新后重放：先用 `req-manual-2` + ANALYST（不带部门）在**在服 v1** 查到 3 条记录，
+再发布 opt-in v2（按 2.2 的规则 JSON），用**同一个 requestId** 重试——仍返回 v1 的
+3 条记录与哈希脱敏，审计仅一条。
 
 单测日志统一打印**请求输入、策略版本与判定依据**（`basis=...`），例如：
 
 ```
 policy decision basis: requestId=req-1, policyVersion=v1, matchedRuleId=r-analyst-read, overallDenyReason=null
-record visibility test: input=3 rows(department), condition=department==subject.department, basis='命中保留、不命中整条过滤（不是掏空）'
-access denied: requestId=req-x, policyVersion=v1, reason=RECORD_CONDITION_UNEVALUABLE, detail=..., auditWritten=true
-record visibility duplicate: input=16 same-requestId submissions around v1->v2, basis='single-flight + 重放首次：全部 v1/1 条'
+record-level regression: input=ANALYST without department on serving v1, basis='v1 未 opt-in 记录级：既有请求原样放行，全部 3 条，字段控制照旧'
+record-level test: input=ANALYST department=ENGINEERING, policyVersion=v2(opt-in), basis='命中保留、不命中整条过滤（不是掏空）'
+access denied: requestId=req-x, policyVersion=v2, reason=RECORD_CONDITION_UNEVALUABLE, detail=..., auditWritten=true
+record visibility duplicate: input=16 same-requestId submissions around v1->v2, basis='single-flight + 重放首次：全部复现 v1 的 3 条'
 ```

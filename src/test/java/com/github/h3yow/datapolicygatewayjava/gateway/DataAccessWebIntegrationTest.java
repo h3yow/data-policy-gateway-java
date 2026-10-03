@@ -72,9 +72,10 @@ class DataAccessWebIntegrationTest {
     private String queryBody(String requestId, String role, String department) {
         Map<String, Object> body = new LinkedHashMap<>();
         body.put("requestId", requestId);
-        // ANALYST 规则含记录级条件 record.department == subject.department
+        // 记录级可见性是 opt-in：仅当测试显式发布带 recordCondition 的新版本后才需要部门；
+        // 在服 v1 的 ANALYST 规则不挂记录条件，部门属性可有可无。
         Map<String, String> attrs;
-        if ("ANALYST".equals(role)) {
+        if (department != null) {
             attrs = new LinkedHashMap<>();
             attrs.put("role", role);
             attrs.put("department", department);
@@ -186,13 +187,43 @@ class DataAccessWebIntegrationTest {
     }
 
     @Test
-    void analystOnlySeesOwnDepartmentRecordsOverHttpAndReplayStable() throws Exception {
-        // v1 的 r-analyst-read 含记录级条件 record.department == subject.department
+    void legacyAnalystWithoutDepartmentKeepsOriginalResponseOnServingV1() throws Exception {
+        // 回归：现网分析人员只带 role=ANALYST、不带 department。
+        // 在服 v1 未 opt-in 记录级可见性，必须与迭代前一样放行并返回全部 3 条。
+        String body = """
+                {"requestId":"web-legacy-nodep","subject":{"subjectId":"u-a",
+                "attributes":{"role":"ANALYST"}},
+                "resource":{"resourceType":"customer","resourceId":"*","attributes":{}},
+                "action":"READ"}
+                """;
+        MvcResult result = mvc().perform(post("/api/data/query")
+                        .contentType(MediaType.APPLICATION_JSON).content(body))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.allowed").value(true))
+                .andExpect(jsonPath("$.policyVersion").value("v1"))
+                .andExpect(jsonPath("$.matchedRuleId").value("r-analyst-read"))
+                .andReturn();
+        JsonNode json = objectMapper.readTree(result.getResponse().getContentAsString());
+        assertEquals(3, json.get("records").size(),
+                "未启用记录级的在服策略：既有请求必须照旧返回全部 3 条，不得整单拒绝");
+        assertFalse(json.get("records").get(0).has("nationalId"),
+                "字段级剥离行为与迭代前一致");
+        log.info("web test: input=web-legacy-nodep ANALYST 无 department on v1, "
+                + "basis='在服策略未 opt-in：既有调用恢复原样（3 条 + 原字段控制）', recordCount={}",
+                json.get("records").size());
+    }
+
+    @Test
+    void analystOnlySeesOwnDepartmentRecordsAfterOptInAndReplayStable() throws Exception {
+        // 业务主动发布启用记录级可见性的 v2；在服 v1 流量不受影响
+        policyStore.publish(
+                BootstrapPolicyInitializer.recordVisibilityOptInDefinition("v2"), "v1");
+
         MvcResult engineering = mvc().perform(post("/api/data/query")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(queryBody("web-rec-eng", "ANALYST")))
                 .andExpect(status().isOk())
-                .andExpect(jsonPath("$.policyVersion").value("v1"))
+                .andExpect(jsonPath("$.policyVersion").value("v2"))
                 .andExpect(jsonPath("$.matchedRuleId").value("r-analyst-read"))
                 .andReturn();
         JsonNode engJson = objectMapper.readTree(
@@ -201,7 +232,7 @@ class DataAccessWebIntegrationTest {
         assertEquals("C001", engJson.get("records").get(0).get("id").asText());
         assertFalse(engJson.get("records").get(0).has("nationalId"),
                 "记录级过滤与字段级剥离叠加");
-        log.info("web test: input=web-rec-eng ANALYST/ENGINEERING, policyVersion=v1, "
+        log.info("web test: input=web-rec-eng ANALYST/ENGINEERING, policyVersion=v2(opt-in), "
                 + "basis='记录级条件只放行本部门记录，字段级剥离仍生效', recordCount={}",
                 engJson.get("records").size());
 
@@ -220,7 +251,7 @@ class DataAccessWebIntegrationTest {
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(queryBody("web-rec-eng", "ANALYST")))
                 .andExpect(status().isOk())
-                .andExpect(jsonPath("$.policyVersion").value("v1"))
+                .andExpect(jsonPath("$.policyVersion").value("v2"))
                 .andReturn();
         JsonNode replayJson = objectMapper.readTree(replay.getResponse().getContentAsString());
         assertEquals(1, replayJson.get("records").size());
@@ -230,7 +261,9 @@ class DataAccessWebIntegrationTest {
 
     @Test
     void recordConditionUnevaluableReturns403WithDistinctReasonOverHttp() throws Exception {
-        // ANALYST 但主体不带 department：规则命中、记录条件右值缺失 -> 403 + 专门原因码
+        // 仅在主动 opt-in 的 v2 上，ANALYST 不带 department 才会令记录条件无法求值
+        policyStore.publish(
+                BootstrapPolicyInitializer.recordVisibilityOptInDefinition("v2"), "v1");
         String body = """
                 {"requestId":"web-rec-noattr","subject":{"subjectId":"u-a",
                 "attributes":{"role":"ANALYST"}},
@@ -240,6 +273,7 @@ class DataAccessWebIntegrationTest {
         MvcResult result = mvc().perform(post("/api/data/query")
                         .contentType(MediaType.APPLICATION_JSON).content(body))
                 .andExpect(status().isForbidden())
+                .andExpect(jsonPath("$.policyVersion").value("v2"))
                 .andExpect(jsonPath("$.denyReason").value("RECORD_CONDITION_UNEVALUABLE"))
                 .andExpect(jsonPath("$.records").isArray())
                 .andReturn();
@@ -247,7 +281,7 @@ class DataAccessWebIntegrationTest {
         JsonNode json = objectMapper.readTree(responseBody);
         assertEquals(0, json.get("records").size());
         assertFalse(responseBody.contains("110101"), "拒绝体不得携带数据");
-        log.info("web test: input=web-rec-noattr ANALYST 无 department, "
+        log.info("web test: input=web-rec-noattr ANALYST 无 department on v2(opt-in), "
                 + "basis='记录条件无法求值 403，原因码可区分', body={}", responseBody);
     }
 }

@@ -43,8 +43,8 @@ class DataAccessGatewayTest {
     private DataAccessGateway gateway;
 
     private AccessRequest request(String requestId, String role) {
-        // ANALYST 规则含记录级条件 record.department == subject.department，
-        // 测试请求需携带所属部门（ENGINEERING 数据源有对应记录）
+        // 在服 v1 的 ANALYST 规则不挂记录级条件；这里仍携带部门，仅用于证明
+        // 带了部门也不会触发任何过滤（记录级只在主动 opt-in 的新版本生效）。
         Map<String, String> attrs = "ANALYST".equals(role)
                 ? Map.of("role", role, "department", "ENGINEERING")
                 : Map.of("role", role);

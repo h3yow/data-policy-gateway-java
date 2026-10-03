@@ -11,11 +11,7 @@ import com.github.h3yow.datapolicygatewayjava.masking.Masker;
 import com.github.h3yow.datapolicygatewayjava.model.AccessAction;
 import com.github.h3yow.datapolicygatewayjava.model.AccessRequest;
 import com.github.h3yow.datapolicygatewayjava.model.AccessResult;
-import com.github.h3yow.datapolicygatewayjava.model.DenyReason;
-import com.github.h3yow.datapolicygatewayjava.model.FieldPolicy;
-import com.github.h3yow.datapolicygatewayjava.model.MaskingType;
 import com.github.h3yow.datapolicygatewayjava.model.PolicyDefinition;
-import com.github.h3yow.datapolicygatewayjava.model.PolicyRule;
 import com.github.h3yow.datapolicygatewayjava.model.ResourceRef;
 import com.github.h3yow.datapolicygatewayjava.model.SubjectAttributes;
 import com.github.h3yow.datapolicygatewayjava.policy.PolicyEvaluator;
@@ -48,22 +44,9 @@ class RecordVisibilityConcurrencyTest {
     private static final Logger log =
             LoggerFactory.getLogger(RecordVisibilityConcurrencyTest.class);
 
-    /** v2 语义：ANALYST 无记录级条件（可见全部 3 条），用于和 v1（只见本部门 1 条）区分。 */
+    /** v2 语义：业务主动 opt-in 记录级可见性，ANALYST 由 v1 的全部 3 条变成本部门 1 条。 */
     private static PolicyDefinition v2Def() {
-        PolicyRule analystV2 = new PolicyRule("r-analyst-read",
-                Map.of("role", "ANALYST"), "customer", AccessAction.READ,
-                List.of(
-                        new FieldPolicy("id", true, MaskingType.NONE, Map.of()),
-                        new FieldPolicy("name", true, MaskingType.NONE, Map.of()),
-                        new FieldPolicy("department", true, MaskingType.NONE, Map.of()),
-                        new FieldPolicy("phone", true, MaskingType.NONE, Map.of()),
-                        new FieldPolicy("email", true, MaskingType.NONE, Map.of()),
-                        new FieldPolicy("nationalId", false, MaskingType.NONE, Map.of()),
-                        new FieldPolicy("salary", false, MaskingType.NONE, Map.of())),
-                false, null);
-        return new PolicyDefinition("v2", List.of(
-                BootstrapPolicyInitializer.adminRule(), analystV2,
-                BootstrapPolicyInitializer.guestRule()));
+        return BootstrapPolicyInitializer.recordVisibilityOptInDefinition("v2");
     }
 
     private static AccessRequest analystReq(String requestId) {
@@ -95,7 +78,7 @@ class RecordVisibilityConcurrencyTest {
                 seq, failures, failureMessages, v1Responses, v2Responses);
         phase1Done.await();
 
-        // 运行中发布 v2（ANALYST 由 1 条变 3 条）
+        // 运行中发布 v2（ANALYST 主动 opt-in 记录级：3 条变 1 条）
         store.publish(v2Def(), "v1");
 
         // 阶段 2：新一批 8 线程并发读 v2
@@ -105,7 +88,7 @@ class RecordVisibilityConcurrencyTest {
 
         int total = threads * perPhase * 2;
         log.info("record visibility concurrency: input={} readers x{} requests before v1->v2 "
-                        + "and same after (ANALYST 1 record -> 3 records), "
+                        + "and same after (v1 serving no filter: 3 records; v2 opt-in: 1 record), "
                         + "basis='快照原子切换 + 同版本记录数/字段/审计自洽': "
                         + "v1={}, v2={}, auditCount={}, failures={}",
                 threads, perPhase, v1Responses.get(), v2Responses.get(),
@@ -135,7 +118,8 @@ class RecordVisibilityConcurrencyTest {
                 try {
                     roundStart.await();
                     String expectedVersion = phase == 1 ? "v1" : "v2";
-                    int expectedCount = phase == 1 ? 1 : 3;
+                    // v1 在服策略未 opt-in：全部 3 条；v2 opt-in 记录级：本部门 1 条
+                    int expectedCount = phase == 1 ? 3 : 1;
                     for (int i2 = 0; i2 < perPhase; i2++) {
                         String requestId = "rv-conc-p" + phase + "-" + seq.incrementAndGet();
                         String responseVersion;
@@ -245,7 +229,8 @@ class RecordVisibilityConcurrencyTest {
         done.await();
 
         log.info("record visibility duplicate: input={} same-requestId submissions around "
-                        + "v1->v2, basis='single-flight + 重放首次：全部 v1/1 条', versions={}, counts={}",
+                        + "v1->v2, basis='single-flight + 重放首次：全部复现 v1（在服、未过滤）的 3 条', "
+                        + "versions={}, counts={}",
                 threads, versions, counts);
 
         assertEquals(0, failures.get());
@@ -253,7 +238,8 @@ class RecordVisibilityConcurrencyTest {
         assertEquals(1, distinctVersions, "所有响应必须复现同一首次版本，不得新旧混合");
         long distinctCounts = counts.values().stream().distinct().count();
         assertEquals(1, distinctCounts, "所有响应必须复现同一首次记录集合");
-        assertEquals(1, counts.values().iterator().next());
+        assertEquals(3, counts.values().iterator().next(),
+                "首次发生在未 opt-in 的 v1：全部 3 条，即使 v2 已发布也必须复现");
         assertEquals("v1", versions.values().iterator().next(),
                 "首次发生在 v1，更新后提交也必须复现 v1 结果");
         long auditCount = audit.all().stream()

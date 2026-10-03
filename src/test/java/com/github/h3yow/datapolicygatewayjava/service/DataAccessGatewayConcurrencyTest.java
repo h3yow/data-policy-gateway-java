@@ -109,7 +109,8 @@ class DataAccessGatewayConcurrencyTest {
                     for (int i = 0; i < requestsPerReader; i++) {
                         // 每 10 个请求里混入一个越权角色，验证拒绝路径也稳定
                         String useRole = (i % 10 == 9) ? "UNAUTH_ROLE" : role;
-                        // ANALYST 规则含记录级条件，需要主体携带 department 属性
+                        // 在服版本各规则均不挂记录级条件；ANALYST 带不带部门都放行。
+                        // 这里携带部门仅为覆盖“带部门”的既有请求形态。
                         Map<String, String> subjectAttrs = "ANALYST".equals(useRole)
                                 ? Map.of("role", useRole, "department", "ENGINEERING")
                                 : Map.of("role", useRole);

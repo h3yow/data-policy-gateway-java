@@ -41,8 +41,12 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 /**
  * 记录级可见性网关端到端用例：
  * <ul>
- *   <li>条件命中/不命中：分析人员只见本部门客户，管理员见全部，过滤与字段剥离/脱敏叠加；</li>
- *   <li>条件依赖字段缺失 / 同批结构不一致：整单拒绝，空记录，原因码可区分；</li>
+ *   <li><b>回归</b>：在服 v1 的 ANALYST 规则不挂记录级条件，只带角色不带部门的既有调用
+ *       保持原返回（全部客户记录 + 原字段控制），记录级能力不影响未启用它的线上流量；</li>
+ *   <li>主动 opt-in：发布带记录级条件的新版本后，条件命中/不命中整条过滤，
+ *       管理员规则无条件仍见全部，过滤与字段剥离/哈希叠加；</li>
+ *   <li>条件依赖字段缺失 / 同批结构不一致 / 主体属性缺失：整单拒绝，空记录，
+ *       原因码可区分（不是 POLICY_NO_MATCH / FIELD_FORBIDDEN）；</li>
  *   <li>策略更新后同一 requestId 重试/重复提交：复现首次结果（放行或拒绝），审计不重不漏。</li>
  * </ul>
  */
@@ -70,10 +74,10 @@ class RecordLevelAccessGatewayTest {
                 new ResourceRef(CUSTOMER, "*", Map.of()), AccessAction.READ);
     }
 
-    // ---- 1. 条件命中/不命中 + 与字段级叠加 ----
+    // ---- 0. 回归：在服 v1 未启用记录级过滤，既有调用保持原返回 ----
 
     @Test
-    void analystSeesOnlyOwnDepartmentRecordsWithFieldControlsApplied() {
+    void legacyAnalystWithoutDepartmentKeepsOriginalResultOnServingV1() {
         PolicyStore store = new PolicyStore();
         store.publish(BootstrapPolicyInitializer.v1(), null);
         AuditService audit = new AuditService();
@@ -81,14 +85,64 @@ class RecordLevelAccessGatewayTest {
                 new PolicyEvaluator(), new RecordVisibilityEvaluator(), new Masker(),
                 audit, List.of(new InMemoryDataSource()), new ResponseReplayStore());
 
+        // 现网这批分析人员只带角色、不带所属部门：v1 必须照旧放行并返回全部 3 条，
+        // 绝不能因为新迭代挂上记录级条件而整单拒绝。
+        AccessResult result = gateway.execute(analystRequest("req-legacy-nodep", null));
+        log.info("record-level regression: input=ANALYST without department on serving v1, "
+                + "basis='v1 未 opt-in 记录级：既有请求原样放行，全部 3 条，字段控制照旧', "
+                + "allowed={}, recordCount={}", result.allowed(), result.records().size());
+
+        assertTrue(result.allowed());
+        assertEquals("v1", result.policyVersion());
+        assertEquals(3, result.records().size(), "既有行为：全部客户记录，不得被整单拒绝");
+        Map<String, Object> first = result.records().get(0);
+        // 字段级授权/脱敏与迭代前完全一致
+        assertFalse(first.containsKey("nationalId"));
+        assertFalse(first.containsKey("salary"));
+        assertEquals(64, ((String) first.get("phone")).length());
+        AuditRecord auditRecord = audit.findByRequestId("req-legacy-nodep").orElseThrow();
+        assertTrue(auditRecord.allowed());
+        assertEquals("v1", auditRecord.policyVersion());
+    }
+
+    @Test
+    void analystWithDepartmentAlsoSeesAllOnServingV1BeforeOptIn() {
+        PolicyStore store = new PolicyStore();
+        store.publish(BootstrapPolicyInitializer.v1(), null);
+        AuditService audit = new AuditService();
+        DataAccessGateway gateway = new DataAccessGateway(store,
+                new PolicyEvaluator(), new RecordVisibilityEvaluator(), new Masker(),
+                audit, List.of(new InMemoryDataSource()), new ResponseReplayStore());
+
+        // 即使带了部门，v1 也不做记录级过滤——只有显式 opt-in 的新版本才过滤
+        AccessResult result = gateway.execute(analystRequest("req-legacy-dep", "ENGINEERING"));
+        log.info("record-level regression: input=ANALYST/ENGINEERING on serving v1, "
+                + "basis='未 opt-in 不过滤：仍返回全部 3 条', recordCount={}",
+                result.records().size());
+        assertEquals(3, result.records().size());
+    }
+
+    // ---- 1. opt-in 启用后：条件命中/不命中 + 与字段级叠加 ----
+
+    @Test
+    void analystSeesOnlyOwnDepartmentRecordsAfterOptInWithFieldControlsApplied() {
+        PolicyStore store = new PolicyStore();
+        store.publish(BootstrapPolicyInitializer.v1(), null);
+        // 业务按自己的节奏发布启用记录级可见性的 v2；在服 v1 流量不受影响
+        store.publish(BootstrapPolicyInitializer.recordVisibilityOptInDefinition("v2"), "v1");
+        AuditService audit = new AuditService();
+        DataAccessGateway gateway = new DataAccessGateway(store,
+                new PolicyEvaluator(), new RecordVisibilityEvaluator(), new Masker(),
+                audit, List.of(new InMemoryDataSource()), new ResponseReplayStore());
+
         // ENGINEERING 部门：数据源 3 条中仅 C001 属于 ENGINEERING
         AccessResult result = gateway.execute(analystRequest("req-rec-1", "ENGINEERING"));
-        log.info("record-level test: input=ANALYST department=ENGINEERING, policyVersion=v1, "
+        log.info("record-level test: input=ANALYST department=ENGINEERING, policyVersion=v2(opt-in), "
                 + "basis='record.department==subject.department 过滤 + nationalId/salary 剥离 + phone/email 哈希', "
                 + "recordCount={}", result.records().size());
 
         assertTrue(result.allowed());
-        assertEquals("v1", result.policyVersion());
+        assertEquals("v2", result.policyVersion());
         assertEquals(1, result.records().size(), "只应看到本部门 1 条记录");
         Map<String, Object> row = result.records().get(0);
         assertEquals("C001", row.get("id"));
@@ -109,7 +163,7 @@ class RecordLevelAccessGatewayTest {
         assertEquals(0, none.records().size());
 
         AuditRecord a1 = audit.findByRequestId("req-rec-1").orElseThrow();
-        assertEquals("v1", a1.policyVersion());
+        assertEquals("v2", a1.policyVersion());
         assertTrue(a1.allowed());
     }
 
@@ -225,6 +279,8 @@ class RecordLevelAccessGatewayTest {
     void missingSubjectAttributeIsRecordUnevaluableNotNoMatch() {
         PolicyStore store = new PolicyStore();
         store.publish(BootstrapPolicyInitializer.v1(), null);
+        // 仅在主动 opt-in 的 v2 上，缺 department 才会令记录条件无法求值
+        store.publish(BootstrapPolicyInitializer.recordVisibilityOptInDefinition("v2"), "v1");
         AuditService audit = new AuditService();
         DataAccessGateway gateway = new DataAccessGateway(store,
                 new PolicyEvaluator(), new RecordVisibilityEvaluator(), new Masker(),
@@ -233,11 +289,12 @@ class RecordLevelAccessGatewayTest {
         // 角色命中 r-analyst-read，但主体缺少 department 属性：条件无法求值
         AccessDeniedException ex = assertThrows(AccessDeniedException.class,
                 () -> gateway.execute(analystRequest("req-rec-noattr", null)));
-        log.info("record-level test: input=ANALYST 无 department 属性, policyVersion=v1, "
+        log.info("record-level test: input=ANALYST 无 department 属性, policyVersion=v2(opt-in), "
                 + "basis='规则命中但记录条件右值缺失 -> RECORD_CONDITION_UNEVALUABLE（区别于 POLICY_NO_MATCH）', "
                 + "denyReason={}", ex.reason());
 
         assertEquals(DenyReason.RECORD_CONDITION_UNEVALUABLE, ex.reason());
+        assertEquals("v2", ex.policyVersion());
         AuditRecord a = audit.findByRequestId("req-rec-noattr").orElseThrow();
         assertEquals("r-analyst-read", a.matchedRuleId(), "规则确实命中");
     }
@@ -247,6 +304,7 @@ class RecordLevelAccessGatewayTest {
     @Test
     void replayAfterPolicyUpdateReproducesFirstVisibleRecords() {
         PolicyStore store = new PolicyStore();
+        // 首次发生在在服 v1：尚未 opt-in 记录级，ANALYST/ENGINEERING 可见全部 3 条
         store.publish(BootstrapPolicyInitializer.v1(), null);
         AuditService audit = new AuditService();
         ResponseReplayStore replay = new ResponseReplayStore();
@@ -254,41 +312,27 @@ class RecordLevelAccessGatewayTest {
                 new PolicyEvaluator(), new RecordVisibilityEvaluator(), new Masker(),
                 audit, List.of(new InMemoryDataSource()), replay);
 
-        // 首次：v1 下 ANALYST 只见本部门 1 条
         AccessResult first = gateway.execute(analystRequest("req-replay-1", "ENGINEERING"));
         assertEquals("v1", first.policyVersion());
-        assertEquals(1, first.records().size());
+        assertEquals(3, first.records().size(), "在服 v1 不过滤：首次结果为全部 3 条");
 
-        // 运行中发布 v2：ANALYST 规则去掉记录级条件（见全部）并调整脱敏
-        PolicyRule analystV2 = new PolicyRule("r-analyst-read",
-                Map.of("role", "ANALYST"), CUSTOMER, AccessAction.READ,
-                List.of(
-                        new FieldPolicy("id", true, MaskingType.NONE, Map.of()),
-                        new FieldPolicy("name", true, MaskingType.NONE, Map.of()),
-                        new FieldPolicy("department", true, MaskingType.NONE, Map.of()),
-                        new FieldPolicy("phone", true, MaskingType.FULL_MASK, Map.of()),
-                        new FieldPolicy("email", true, MaskingType.FULL_MASK, Map.of()),
-                        new FieldPolicy("nationalId", true, MaskingType.NONE, Map.of()),
-                        new FieldPolicy("salary", true, MaskingType.NONE, Map.of())),
-                false, null);
-        store.publish(new PolicyDefinition("v2",
-                List.of(BootstrapPolicyInitializer.adminRule(), analystV2,
-                        BootstrapPolicyInitializer.guestRule())), "v1");
+        // 业务随后主动发布 v2 启用记录级过滤（按新版本 ANALYST 应只见本部门 1 条）
+        store.publish(BootstrapPolicyInitializer.recordVisibilityOptInDefinition("v2"), "v1");
 
-        // 用同一 requestId 重试：必须复现首次（v1、1 条、哈希脱敏、字段剥离）
+        // 用同一 requestId 重试：必须复现首次（v1、3 条、哈希脱敏、字段剥离），
+        // 而不是按 v2 重新求值成 1 条
         AccessResult retried = gateway.execute(analystRequest("req-replay-1", "ENGINEERING"));
-        log.info("record-level test: input=req-replay-1 策略 v1->v2 后同标识重试, "
-                + "basis='重放首次：v1/1 条/哈希/剥离，而非 v2 的 3 条/全掩码', "
+        log.info("record-level test: input=req-replay-1 策略 v1(不过滤)->v2(opt-in 过滤) 后同标识重试, "
+                + "basis='重放首次：v1/3 条/哈希/剥离，而非 v2 的 1 条', "
                 + "first(v={},n={}) retry(v={},n={})",
                 first.policyVersion(), first.records().size(),
                 retried.policyVersion(), retried.records().size());
 
         assertEquals(first.policyVersion(), retried.policyVersion());
         assertEquals(first.records().size(), retried.records().size());
-        assertEquals(1, retried.records().size());
-        assertEquals("C001", retried.records().get(0).get("id"));
+        assertEquals(3, retried.records().size());
         assertEquals(64, ((String) retried.records().get(0).get("phone")).length(),
-                "必须复现首次的哈希脱敏，而不是 v2 的 FULL_MASK");
+                "必须复现首次的哈希脱敏");
         assertFalse(retried.records().get(0).containsKey("nationalId"),
                 "必须复现首次的字段剥离结果");
         long auditCount = audit.all().stream()
@@ -299,14 +343,16 @@ class RecordLevelAccessGatewayTest {
     @Test
     void replayAfterPolicyUpdateReproducesFirstDenyReason() {
         PolicyStore store = new PolicyStore();
-        store.publish(BootstrapPolicyInitializer.v1(), null);
+        // 先用 opt-in 的 v1 承载“记录级已启用、但调用方还没补部门”的首次拒绝；
+        // （生产中这代表某个已经主动启用记录级的策略版本。）
+        store.publish(BootstrapPolicyInitializer.recordVisibilityOptInDefinition("v1"), null);
         AuditService audit = new AuditService();
         ResponseReplayStore replay = new ResponseReplayStore();
         DataAccessGateway gateway = new DataAccessGateway(store,
                 new PolicyEvaluator(), new RecordVisibilityEvaluator(), new Masker(),
                 audit, List.of(new InMemoryDataSource()), replay);
 
-        // 首次：缺 department 属性 -> v1 下 RECORD_CONDITION_UNEVALUABLE 拒绝
+        // 首次：缺 department 属性 -> v1(opt-in) 下 RECORD_CONDITION_UNEVALUABLE 拒绝
         AccessDeniedException first = assertThrows(AccessDeniedException.class,
                 () -> gateway.execute(analystRequest("req-replay-deny", null)));
         assertEquals("v1", first.policyVersion());
@@ -331,7 +377,7 @@ class RecordLevelAccessGatewayTest {
         // 同标识重试：仍复现首次拒绝（v1 + 同样原因），而不是按 v2 放行
         AccessDeniedException retried = assertThrows(AccessDeniedException.class,
                 () -> gateway.execute(analystRequest("req-replay-deny", null)));
-        log.info("record-level test: input=req-replay-deny v1->v2 后同标识重试, "
+        log.info("record-level test: input=req-replay-deny v1(opt-in)->v2(关闭记录级) 后同标识重试, "
                 + "basis='重放首次拒绝原因与版本', first(v={},r={}) retry(v={},r={})",
                 first.policyVersion(), first.reason(),
                 retried.policyVersion(), retried.reason());
