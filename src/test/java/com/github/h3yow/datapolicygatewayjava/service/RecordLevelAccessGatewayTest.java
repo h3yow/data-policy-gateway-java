@@ -39,12 +39,13 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * 记录级可见性网关端到端用例：
+ * 记录级可见性网关端到端用例（均基于<b>显式启用</b>记录级过滤的策略版本）：
  * <ul>
  *   <li>条件命中/不命中：分析人员只见本部门客户，管理员见全部，过滤与字段剥离/脱敏叠加；</li>
  *   <li>条件依赖字段缺失 / 同批结构不一致：整单拒绝，空记录，原因码可区分；</li>
  *   <li>策略更新后同一 requestId 重试/重复提交：复现首次结果（放行或拒绝），审计不重不漏。</li>
  * </ul>
+ * 在服 v1（未启用记录级）的兼容性回归见 {@link ServingPolicyCompatibilityTest}。
  */
 class RecordLevelAccessGatewayTest {
 
@@ -52,6 +53,14 @@ class RecordLevelAccessGatewayTest {
             LoggerFactory.getLogger(RecordLevelAccessGatewayTest.class);
 
     private static final String CUSTOMER = InMemoryDataSource.RESOURCE_TYPE;
+
+    /** 指定版本号的“启用记录级过滤”策略：与在服 v1 字段级一致，ANALYST 叠加本部门过滤。 */
+    private static PolicyDefinition recordLevelPolicy(String version) {
+        return new PolicyDefinition(version, List.of(
+                BootstrapPolicyInitializer.adminRule(),
+                BootstrapPolicyInitializer.analystRuleWithRecordVisibility(),
+                BootstrapPolicyInitializer.guestRule()));
+    }
 
     private AccessRequest analystRequest(String requestId, String department) {
         Map<String, String> attrs = new LinkedHashMap<>();
@@ -75,7 +84,7 @@ class RecordLevelAccessGatewayTest {
     @Test
     void analystSeesOnlyOwnDepartmentRecordsWithFieldControlsApplied() {
         PolicyStore store = new PolicyStore();
-        store.publish(BootstrapPolicyInitializer.v1(), null);
+        store.publish(recordLevelPolicy("v1"), null);
         AuditService audit = new AuditService();
         DataAccessGateway gateway = new DataAccessGateway(store,
                 new PolicyEvaluator(), new RecordVisibilityEvaluator(), new Masker(),
@@ -157,7 +166,7 @@ class RecordLevelAccessGatewayTest {
                         new FieldPolicy("email", true, MaskingType.HASH, Map.of()),
                         new FieldPolicy("nationalId", false, MaskingType.NONE, Map.of()),
                         new FieldPolicy("salary", false, MaskingType.NONE, Map.of())),
-                false, condition);
+                false, condition, true);
     }
 
     private DataAccessGateway gatewayWith(PolicyStore store, MutableDataSource source,
@@ -224,7 +233,7 @@ class RecordLevelAccessGatewayTest {
     @Test
     void missingSubjectAttributeIsRecordUnevaluableNotNoMatch() {
         PolicyStore store = new PolicyStore();
-        store.publish(BootstrapPolicyInitializer.v1(), null);
+        store.publish(recordLevelPolicy("v1"), null);
         AuditService audit = new AuditService();
         DataAccessGateway gateway = new DataAccessGateway(store,
                 new PolicyEvaluator(), new RecordVisibilityEvaluator(), new Masker(),
@@ -247,7 +256,7 @@ class RecordLevelAccessGatewayTest {
     @Test
     void replayAfterPolicyUpdateReproducesFirstVisibleRecords() {
         PolicyStore store = new PolicyStore();
-        store.publish(BootstrapPolicyInitializer.v1(), null);
+        store.publish(recordLevelPolicy("v1"), null);
         AuditService audit = new AuditService();
         ResponseReplayStore replay = new ResponseReplayStore();
         DataAccessGateway gateway = new DataAccessGateway(store,
@@ -299,7 +308,7 @@ class RecordLevelAccessGatewayTest {
     @Test
     void replayAfterPolicyUpdateReproducesFirstDenyReason() {
         PolicyStore store = new PolicyStore();
-        store.publish(BootstrapPolicyInitializer.v1(), null);
+        store.publish(recordLevelPolicy("v1"), null);
         AuditService audit = new AuditService();
         ResponseReplayStore replay = new ResponseReplayStore();
         DataAccessGateway gateway = new DataAccessGateway(store,

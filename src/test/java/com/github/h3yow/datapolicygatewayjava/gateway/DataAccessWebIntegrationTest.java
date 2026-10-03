@@ -186,13 +186,45 @@ class DataAccessWebIntegrationTest {
     }
 
     @Test
+    void roleOnlyAnalystKeepsOriginalResultOverHttp() throws Exception {
+        // 现网既有调用形态：ANALYST 只带 role、不带 department；在服 v1 未启用记录级
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("requestId", "web-legacy-1");
+        body.put("subject", Map.of("subjectId", "u-analyst",
+                "attributes", Map.of("role", "ANALYST")));
+        body.put("resource", Map.of("resourceType", "customer",
+                "resourceId", "*", "attributes", Map.of()));
+        body.put("action", "READ");
+        MvcResult result = mvc().perform(post("/api/data/query")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(body)))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.allowed").value(true))
+                .andExpect(jsonPath("$.policyVersion").value("v1"))
+                .andExpect(jsonPath("$.matchedRuleId").value("r-analyst-read"))
+                .andReturn();
+        JsonNode json = objectMapper.readTree(result.getResponse().getContentAsString());
+        log.info("web test: input=web-legacy-1 ANALYST 仅 role, policyVersion=v1, "
+                + "basis='在服 v1 未启用记录级：既有请求保持原返回（3 条 + 字段级剥离/哈希）', "
+                + "recordCount={}", json.get("records").size());
+
+        assertEquals(3, json.get("records").size(), "既有请求必须保持原有返回：全部记录");
+        JsonNode row = json.get("records").get(0);
+        assertFalse(row.has("nationalId"));
+        assertFalse(row.has("salary"));
+        assertEquals(64, row.get("phone").asText().length(), "手机仍为哈希");
+    }
+
+    @Test
     void analystOnlySeesOwnDepartmentRecordsOverHttpAndReplayStable() throws Exception {
-        // v1 的 r-analyst-read 含记录级条件 record.department == subject.department
+        // 按团队节奏发布 v2：ANALYST 规则显式启用记录级条件
+        // record.department == subject.department
+        policyStore.publish(BootstrapPolicyInitializer.v2(), "v1");
         MvcResult engineering = mvc().perform(post("/api/data/query")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(queryBody("web-rec-eng", "ANALYST")))
                 .andExpect(status().isOk())
-                .andExpect(jsonPath("$.policyVersion").value("v1"))
+                .andExpect(jsonPath("$.policyVersion").value("v2"))
                 .andExpect(jsonPath("$.matchedRuleId").value("r-analyst-read"))
                 .andReturn();
         JsonNode engJson = objectMapper.readTree(
@@ -201,7 +233,7 @@ class DataAccessWebIntegrationTest {
         assertEquals("C001", engJson.get("records").get(0).get("id").asText());
         assertFalse(engJson.get("records").get(0).has("nationalId"),
                 "记录级过滤与字段级剥离叠加");
-        log.info("web test: input=web-rec-eng ANALYST/ENGINEERING, policyVersion=v1, "
+        log.info("web test: input=web-rec-eng ANALYST/ENGINEERING, policyVersion=v2, "
                 + "basis='记录级条件只放行本部门记录，字段级剥离仍生效', recordCount={}",
                 engJson.get("records").size());
 
@@ -220,7 +252,7 @@ class DataAccessWebIntegrationTest {
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(queryBody("web-rec-eng", "ANALYST")))
                 .andExpect(status().isOk())
-                .andExpect(jsonPath("$.policyVersion").value("v1"))
+                .andExpect(jsonPath("$.policyVersion").value("v2"))
                 .andReturn();
         JsonNode replayJson = objectMapper.readTree(replay.getResponse().getContentAsString());
         assertEquals(1, replayJson.get("records").size());
@@ -229,8 +261,63 @@ class DataAccessWebIntegrationTest {
     }
 
     @Test
+    void recordVisibilityEnabledOverAdminApiActivatesFiltering() throws Exception {
+        // 经管理接口发布 v2：ANALYST 规则 recordVisibilityEnabled=true + 本部门条件
+        String v2 = """
+                {"version":"v2","rules":[
+                  {"ruleId":"r-analyst-read","subjectConditions":{"role":"ANALYST"},
+                   "resourceType":"customer","action":"READ","defaultVisible":false,
+                   "recordCondition":{"terms":[{"field":"department","operator":"EQ",
+                     "expectedFromSubjectAttribute":"department"}]},
+                   "recordVisibilityEnabled":true,
+                   "fieldPolicies":[
+                     {"fieldName":"id","visible":true,"maskingType":"NONE","maskingParams":{}},
+                     {"fieldName":"name","visible":true,"maskingType":"NONE","maskingParams":{}},
+                     {"fieldName":"department","visible":true,"maskingType":"NONE","maskingParams":{}},
+                     {"fieldName":"phone","visible":true,"maskingType":"HASH","maskingParams":{}},
+                     {"fieldName":"email","visible":true,"maskingType":"HASH","maskingParams":{}},
+                     {"fieldName":"nationalId","visible":false,"maskingType":"NONE","maskingParams":{}},
+                     {"fieldName":"salary","visible":false,"maskingType":"NONE","maskingParams":{}}]}]}
+                """;
+        mvc().perform(post("/api/policies").param("expectedParentVersion", "v1")
+                        .contentType(MediaType.APPLICATION_JSON).content(v2))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.policyVersion").value("v2"));
+
+        // 带部门：仅见本部门 1 条
+        MvcResult filtered = mvc().perform(post("/api/data/query")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(queryBody("web-optin-1", "ANALYST")))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.policyVersion").value("v2"))
+                .andReturn();
+        JsonNode filteredJson = objectMapper.readTree(
+                filtered.getResponse().getContentAsString());
+        assertEquals(1, filteredJson.get("records").size());
+        assertEquals("C001", filteredJson.get("records").get(0).get("id").asText());
+
+        // 不带部门：记录条件无法求值 -> 403 专码
+        Map<String, Object> noDept = new LinkedHashMap<>();
+        noDept.put("requestId", "web-optin-2");
+        noDept.put("subject", Map.of("subjectId", "u-analyst",
+                "attributes", Map.of("role", "ANALYST")));
+        noDept.put("resource", Map.of("resourceType", "customer",
+                "resourceId", "*", "attributes", Map.of()));
+        noDept.put("action", "READ");
+        mvc().perform(post("/api/data/query")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(noDept)))
+                .andExpect(status().isForbidden())
+                .andExpect(jsonPath("$.denyReason").value("RECORD_CONDITION_UNEVALUABLE"));
+        log.info("web test: input=admin API 发布 recordVisibilityEnabled=true 的 v2, "
+                + "basis='管理接口开启记录级：带部门过滤为 1 条，不带部门 403 专码'");
+    }
+
+    @Test
     void recordConditionUnevaluableReturns403WithDistinctReasonOverHttp() throws Exception {
-        // ANALYST 但主体不带 department：规则命中、记录条件右值缺失 -> 403 + 专门原因码
+        // 启用记录级的 v2 下，ANALYST 但主体不带 department：
+        // 规则命中、记录条件右值缺失 -> 403 + 专门原因码
+        policyStore.publish(BootstrapPolicyInitializer.v2(), "v1");
         String body = """
                 {"requestId":"web-rec-noattr","subject":{"subjectId":"u-a",
                 "attributes":{"role":"ANALYST"}},

@@ -48,6 +48,14 @@ class RecordVisibilityConcurrencyTest {
     private static final Logger log =
             LoggerFactory.getLogger(RecordVisibilityConcurrencyTest.class);
 
+    /** v1 语义：ANALYST 显式启用记录级过滤（只见本部门 1 条），用于和 v2（见全部 3 条）区分。 */
+    private static PolicyDefinition recordLevelV1() {
+        return new PolicyDefinition("v1", List.of(
+                BootstrapPolicyInitializer.adminRule(),
+                BootstrapPolicyInitializer.analystRuleWithRecordVisibility(),
+                BootstrapPolicyInitializer.guestRule()));
+    }
+
     /** v2 语义：ANALYST 无记录级条件（可见全部 3 条），用于和 v1（只见本部门 1 条）区分。 */
     private static PolicyDefinition v2Def() {
         PolicyRule analystV2 = new PolicyRule("r-analyst-read",
@@ -76,7 +84,7 @@ class RecordVisibilityConcurrencyTest {
     @Test
     void concurrentReadsDuringRecordPolicyUpdateAreVersionCoherent() throws Exception {
         PolicyStore store = new PolicyStore();
-        store.publish(BootstrapPolicyInitializer.v1(), null);
+        store.publish(recordLevelV1(), null);
         AuditService audit = new AuditService();
         DataAccessGateway gateway = new DataAccessGateway(store,
                 new PolicyEvaluator(), new RecordVisibilityEvaluator(), new Masker(),
@@ -199,7 +207,7 @@ class RecordVisibilityConcurrencyTest {
     @Test
     void concurrentDuplicateSubmissionsDuringUpdateReplayFirstOutcome() throws Exception {
         PolicyStore store = new PolicyStore();
-        store.publish(BootstrapPolicyInitializer.v1(), null);
+        store.publish(recordLevelV1(), null);
         AuditService audit = new AuditService();
         ResponseReplayStore replay = new ResponseReplayStore();
         DataAccessGateway gateway = new DataAccessGateway(store,

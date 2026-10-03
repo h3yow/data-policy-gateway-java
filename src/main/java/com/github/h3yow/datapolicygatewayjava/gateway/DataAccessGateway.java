@@ -41,7 +41,8 @@ import java.util.Set;
  *   <li>从 {@link PolicyStore} 抓取一个不可变快照；无策略可用 → 失败关闭；</li>
  *   <li>从数据源取数（原始数据不离开本组件），用同一快照做字段级求值；
  *       整体拒绝（无匹配/映射缺失）→ 审计后拒绝，不产出任何记录；</li>
- *   <li>用同一快照下命中规则的记录级条件过滤记录：不满足条件的记录整条消失；
+ *   <li>用同一快照下命中规则的记录级条件过滤记录（仅当该规则显式启用记录级过滤；
+ *       未启用的规则行为与引入该能力前完全一致）：不满足条件的记录整条消失；
  *       条件无法求值（依赖字段缺失、结构不一致等）→ {@code RECORD_CONDITION_UNEVALUABLE}
  *       整单失败关闭，绝不只返回一部分能算出来的记录；</li>
  *   <li>对过滤后保留的记录逐字段剥离/脱敏：显式禁止字段剥离，脱敏异常失败关闭；</li>
@@ -156,9 +157,16 @@ public class DataAccessGateway {
         }
         PolicyRule matchedRule = findRule(snapshot, decision.matchedRuleId());
 
-        // 5. 记录级可见性过滤（同一快照、同一命中规则的条件）
-        RecordVisibilityCondition recordCondition = matchedRule == null
-                ? null : matchedRule.recordCondition();
+        // 5. 记录级可见性过滤（同一快照、同一命中规则的条件）。
+        //    仅当规则显式启用（recordVisibilityEnabled）且条件存在时才生效；
+        //    未启用的规则（含在服的旧策略）行为与记录级能力引入前完全一致。
+        RecordVisibilityCondition recordCondition = matchedRule != null
+                && matchedRule.recordVisibilityActive()
+                ? matchedRule.recordCondition() : null;
+        log.info("record visibility basis: requestId={}, policyVersion={}, "
+                        + "matchedRuleId={}, recordFilterActive={}",
+                request.requestId(), version, decision.matchedRuleId(),
+                matchedRule != null && matchedRule.recordVisibilityActive());
         RecordVisibilityResult recordResult;
         try {
             recordResult = recordEvaluator.evaluate(rawRecords, request.subject(),
